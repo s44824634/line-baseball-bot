@@ -45,12 +45,12 @@ JP_TEAMS = {
     "日本ハム": ("北海道日本ハムファイターズ", "日本火腿鬥士"),
 }
 
-NPB_TEAM_IDS = {   # Yahoo npbTeamN → 短名
+NPB_TEAM_IDS = {   # Yahoo npbTeamN → 短名（依官方頁面實際對照）
     "npbTeam1": "巨人", "npbTeam2": "ヤクルト", "npbTeam3": "DeNA",
     "npbTeam4": "中日", "npbTeam5": "阪神", "npbTeam6": "広島",
     "npbTeam7": "西武", "npbTeam8": "日本ハム", "npbTeam9": "ロッテ",
-    "npbTeam10": "オリックス", "npbTeam11": "ソフトバンク",
-    "npbTeam12": "楽天",
+    "npbTeam11": "オリックス", "npbTeam12": "ソフトバンク",
+    "npbTeam376": "楽天",
 }
 
 ALIASES = {}
@@ -174,6 +174,13 @@ def _cards_for_date(day_iso: str) -> list[dict]:
         tm = re.fullmatch(r"(\d{1,2}):(\d{2})", ttxt)
         status = "予定" if tm else (ttxt or "予定")
 
+        def _score(css):
+            el = li.select_one(css)
+            if not el:
+                return None
+            t = el.get_text(strip=True)
+            return int(t) if t.isdigit() else None
+
         def starter(css):
             el = li.select_one(css)
             if not el:
@@ -188,6 +195,8 @@ def _cards_for_date(day_iso: str) -> list[dict]:
             "stadium": venue_el.get_text(strip=True) if (venue_el and trusted)
                        else None,
             "game_id": gid, "status": status,
+            "away_score": _score(".bb-score__scoreAway"),
+            "home_score": _score(".bb-score__scoreHome"),
             "away_starter": starter(".bb-score__playerAway"),
             "home_starter": starter(".bb-score__playerHome"),
         })

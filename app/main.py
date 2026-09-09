@@ -40,6 +40,42 @@ parser = WebhookParser(CHANNEL_SECRET)
 
 VS_PATTERN = re.compile(r"(.+?)\s*(?:vs\.?|對上|對|@)\s*(.+)")
 RECENT_PATTERN = re.compile(r"最近.*比賽|即將開打|近期賽程")
+SCORE_PATTERN = re.compile(r"即時比分|^比分$|比分表|live score|^live$", re.I)
+
+_bot_user_id: str | None = None
+
+
+def _get_bot_user_id() -> str | None:
+    """向 LINE 查詢機器人自己的 userId（群組中判斷被標註用）。"""
+    global _bot_user_id
+    if _bot_user_id:
+        return _bot_user_id
+    try:
+        import requests
+        r = requests.get("https://api.line.me/v2/bot/info",
+                         headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+                         timeout=10)
+        if r.ok:
+            _bot_user_id = r.json().get("userId")
+    except Exception:
+        log.exception("查詢機器人 userId 失敗")
+    return _bot_user_id
+
+
+def _is_mentioned(event: MessageEvent) -> bool:
+    """群組／聊天室中，只有標註機器人才回覆。"""
+    message = event.message
+    bot_id = _get_bot_user_id()
+    mention = getattr(message, "mention", None)
+    if mention and getattr(mention, "mentionees", None):
+        for m in mention.mentionees:
+            uid = getattr(m, "user_id", None) or getattr(m, "userId", None)
+            if uid and (uid == bot_id or bot_id is None):
+                return True
+        return False
+    # 部分訊息無 mention 結構：有 @ 視為叫機器人
+    text = getattr(message, "text", "") or ""
+    return "@" in text
 
 
 def _reply(reply_token: str, text: str) -> None:
@@ -128,14 +164,25 @@ async def callback(request: Request) -> str:
     for event in events:
         if not isinstance(event, MessageEvent):
             continue
+        # 群組／聊天室：只在被標註時回覆，其餘靜默
+        if event.source.type in ("group", "room") and not _is_mentioned(event):
+            continue
         try:
             if not isinstance(event.message, TextMessageContent):
-                _reply(event.reply_token, "請輸入文字，例如「道奇 vs 洋基」。")
+                if event.source.type == "user":
+                    _reply(event.reply_token, "請輸入文字，例如「道奇 vs 洋基」。")
                 continue
             text = event.message.text.strip()
-            log.info("收到訊息：%s", text)
+            log.info("收到訊息（%s）：%s", event.source.type, text)
             if text.lower() in ("help", "幫助", "使用說明", "?", "？", "選單"):
                 _reply(event.reply_token, HELP_TEXT)
+            elif SCORE_PATTERN.search(text):
+                from app.scores import format_scores
+                try:
+                    _reply(event.reply_token, format_scores())
+                except Exception:
+                    log.exception("即時比分查詢失敗")
+                    _reply(event.reply_token, "即時比分查詢暫時失敗，請稍後再試。")
             elif RECENT_PATTERN.search(text):
                 _handle_schedule(text, event.reply_token)
             else:

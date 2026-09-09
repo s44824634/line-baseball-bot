@@ -1,0 +1,16 @@
+# 每 10 分鐘喚醒 Render 免費方案，避免閒置休眠
+name: keep-alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" https://line-baseball-bot.onrender.com/health)
+          echo "health: $code"
