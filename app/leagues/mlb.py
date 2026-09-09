@@ -32,19 +32,22 @@ class MLBProvider(LeagueProvider):
         return statsapi.list_upcoming(days=days)
 
     def analyze_matchup(self, away_query: str, home_query: str):
+        from app.teams import TEAM_ZH
         away_team = self._resolve(away_query)
         home_team = self._resolve(home_query)
         if not away_team or not home_team:
             return None
         game = statsapi.find_game(away_team["id"])
+        away_zh = TEAM_ZH.get(away_team["id"], away_team["teamName"])
+        home_zh = TEAM_ZH.get(home_team["id"], home_team["teamName"])
         if not game:
-            raise ValueError(f"找不到 {away_team['teamName']} 近期賽程。")
+            raise ValueError(f"找不到 {away_zh} 近期賽程。")
         g_home_id = game["teams"]["home"]["team"]["id"]
         if g_home_id != home_team["id"]:
-            ga = game["teams"]["away"]["team"]["name"]
-            gh = game["teams"]["home"]["team"]["name"]
+            ga = statsapi._zh_team(game["teams"]["away"]["team"])
+            gh = statsapi._zh_team(game["teams"]["home"]["team"])
             raise ValueError(
-                f"{away_team['teamName']} 近期並未對上 {home_team['teamName']}；"
+                f"{away_zh} 近期並未對上 {home_zh}；"
                 f"他們的下一場是：{ga} @ {gh}。"
                 "請輸入正確的對戰組合。")
 
@@ -66,7 +69,7 @@ class MLBProvider(LeagueProvider):
                          "預期得分區間可能放寬。")
         info = GameInfo(
             venue=venue,
-            start_time=game_date[5:16].replace("T", " ").replace("-", "/"),
+            start_time=statsapi.to_taipei_str(game_date),
             weather=weather, roof=roof,
             confirmed={"starter": starter_known, "lineup": False,
                        "weather": weather is not None, "rs_ra": True},

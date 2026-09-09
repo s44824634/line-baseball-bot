@@ -1,5 +1,11 @@
+# 機密與本機設定
+.env
+
+# 本機執行雜項
 .venv/
 __pycache__/
 *.pyc
-.env
-.git/
+*.log
+*.exe
+.vscode/
+.idea/

@@ -4,8 +4,11 @@
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
+
+# 台灣自 1979 年起無日光節約時間，固定 UTC+8 即可
+TAIPEI = timezone(timedelta(hours=8))
 
 import requests
 
@@ -123,8 +126,13 @@ def find_game(team_id: int, on: Optional[date] = None) -> Optional[dict]:
 
 
 def list_upcoming(league_hint: str = "mlb", days: int = 2) -> list[dict]:
-    """列出近期賽程（供『分析最近比賽』指令使用）。"""
-    today = date.today()
+    """列出近期賽程（供『分析最近比賽』指令使用）。
+
+    時間一律轉為台灣時間（Asia/Taipei），並只保留「現在之後」
+    尚未開打的比賽。
+    """
+    now_tp = datetime.now(TAIPEI)
+    today = now_tp.date()
     data = _get("/schedule", {
         "sportId": SPORT_MLB,
         "startDate": today.isoformat(),
@@ -134,21 +142,52 @@ def list_upcoming(league_hint: str = "mlb", days: int = 2) -> list[dict]:
     games = []
     for d in data.get("dates", []):
         for g in d.get("games", []):
+            raw = g.get("gameDate") or ""
+            start_tp = None
+            if raw:
+                try:
+                    start_utc = datetime.fromisoformat(
+                        raw.replace("Z", "+00:00"))
+                    start_tp = start_utc.astimezone(TAIPEI)
+                except ValueError:
+                    start_tp = None
+            if start_tp and start_tp <= now_tp:
+                continue  # 台灣時間已開打／打完，不再列出
             games.append({
-                "date": d.get("date"),
-                "away": g["teams"]["away"]["team"]["name"],
-                "home": g["teams"]["home"]["team"]["name"],
-                "time": (g.get("gameDate", "")[11:16] + " UTC")
-                        if g.get("gameDate") else None,
+                "date": (start_tp.strftime("%m/%d") if start_tp
+                         else d.get("date")),
+                "away": _zh_team(g["teams"]["away"]["team"]),
+                "home": _zh_team(g["teams"]["home"]["team"]),
+                "time": (start_tp.strftime("%H:%M") if start_tp else None),
             })
     return games
+
+
+def _zh_team(team: dict) -> str:
+    """API 球隊資料 → 中文隊名（優先），查不到就回傳原名。"""
+    from app.teams import TEAM_ZH
+    return TEAM_ZH.get(team.get("id"), team.get("name", ""))
+
+
+def to_taipei_str(raw_iso: str) -> str:
+    """MLB API 的 UTC ISO 時間 → 'MM/DD HH:MM'（台灣時間）。
+
+    解析失敗時退回原本的字串。
+    """
+    if not raw_iso:
+        return ""
+    try:
+        dt_utc = datetime.fromisoformat(raw_iso.replace("Z", "+00:00"))
+        return dt_utc.astimezone(TAIPEI).strftime("%m/%d %H:%M")
+    except ValueError:
+        return raw_iso[:16].replace("T", " ")
 
 
 def build_team_input(team_id: int, side: str, game: dict) -> "TeamInput":
     """組合引擎所需的 TeamInput（side = 'away' / 'home'）。"""
     from app.analysis.engine import TeamInput
 
-    name = game["teams"][side]["team"]["name"]
+    name = _zh_team(game["teams"][side]["team"])
     rs_pg, ra_pg, _, _ = _team_record_stats(team_id)
     prob = game["teams"][side].get("probablePitcher") or {}
     starter_era = None

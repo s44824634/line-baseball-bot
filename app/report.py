@@ -1,7 +1,17 @@
 """將分析結果格式化為 LINE 文字訊息（五段完整報告）。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# 台灣固定 UTC+8（無日光節約時間）
+TAIPEI = timezone(timedelta(hours=8))
+
+
+def _tp(dt: datetime) -> datetime:
+    """naive（假設本機）或 aware datetime → 台灣時間。"""
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # 本機時區
+    return dt.astimezone(TAIPEI)
 
 from app.analysis.engine import TeamInput
 from app.leagues.base import GameInfo
@@ -149,8 +159,8 @@ def format_report(result: dict, away: TeamInput, home: TeamInput,
             lines.append(f"・{n}")
     lines += [
         "",
-        f"🕒 資料來源：{info.source or '官方資料'}｜擷取："
-        f"{fetched_at:%Y-%m-%d %H:%M}",
+        f"🕒 資料源：{info.source or '官方資料'}｜擷取（台灣時間）："
+        f"{_tp(fetched_at):%Y-%m-%d %H:%M}",
         "",
         DISCLAIMER,
     ]
@@ -160,7 +170,7 @@ def format_report(result: dict, away: TeamInput, home: TeamInput,
 def format_schedule(games: list[dict], league_display: str) -> str:
     if not games:
         return f"近期找不到 {league_display} 賽程。"
-    lines = [f"📅 近期 {league_display} 賽程", ""]
+    lines = [f"📅 近期 {league_display} 賽程（以下皆為台灣時間）", ""]
     for g in games[:12]:
         time_part = f" {g['time']}" if g.get("time") else ""
         lines.append(f"{g['date']}{time_part}｜{g['away']} @ {g['home']}")
