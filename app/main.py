@@ -67,13 +67,14 @@ def _is_mentioned(event: MessageEvent) -> bool:
     message = event.message
     bot_id = _get_bot_user_id()
     mention = getattr(message, "mention", None)
-    if mention and getattr(mention, "mentionees", None):
-        for m in mention.mentionees:
+    mentionees = getattr(mention, "mentionees", None) if mention else None
+    if mentionees:
+        for m in mentionees:
             uid = getattr(m, "user_id", None) or getattr(m, "userId", None)
             if uid and (uid == bot_id or bot_id is None):
                 return True
-        return False
-    # 部分訊息無 mention 結構：有 @ 視為叫機器人
+    # 部分訊息的 mention 結構缺少 userId（或使用者手打 @）：
+    # 一律再以文字中有無「@」判斷，避免誤判漏回
     text = getattr(message, "text", "") or ""
     return "@" in text
 
@@ -165,8 +166,15 @@ async def callback(request: Request) -> str:
         if not isinstance(event, MessageEvent):
             continue
         # 群組／聊天室：只在被標註時回覆，其餘靜默
-        if event.source.type in ("group", "room") and not _is_mentioned(event):
-            continue
+        if event.source.type in ("group", "room"):
+            mentioned = _is_mentioned(event)
+            snippet = ""
+            if isinstance(event.message, TextMessageContent):
+                snippet = event.message.text[:30]
+            log.info("群組訊息（%s mention=%s）：%s",
+                     event.source.type, mentioned, snippet)
+            if not mentioned:
+                continue
         try:
             if not isinstance(event.message, TextMessageContent):
                 if event.source.type == "user":
