@@ -4,3 +4,4 @@ line-bot-sdk>=3.5
 requests>=2.31
 numpy>=1.24
 python-dotenv>=1.0
+beautifulsoup4>=4.12
