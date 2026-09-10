@@ -42,41 +42,44 @@ VS_PATTERN = re.compile(r"(.+?)\s*(?:vs\.?|對上|對|@)\s*(.+)")
 RECENT_PATTERN = re.compile(r"最近.*比賽|即將開打|近期賽程")
 SCORE_PATTERN = re.compile(r"即時比分|^比分$|比分表|live score|^live$", re.I)
 
-_bot_user_id: str | None = None
+_bot_info: tuple[str | None, str | None] = (None, None)
 
 
-def _get_bot_user_id() -> str | None:
-    """向 LINE 查詢機器人自己的 userId（群組中判斷被標註用）。"""
-    global _bot_user_id
-    if _bot_user_id:
-        return _bot_user_id
+def _get_bot_info() -> tuple[str | None, str | None]:
+    """向 LINE 查詢機器人自己的 userId 與名稱（群組中判斷被標註用）。"""
+    global _bot_info
+    if _bot_info != (None, None):
+        return _bot_info
     try:
         import requests
         r = requests.get("https://api.line.me/v2/bot/info",
                          headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
                          timeout=10)
         if r.ok:
-            _bot_user_id = r.json().get("userId")
+            data = r.json()
+            _bot_info = (data.get("userId"), data.get("displayName"))
     except Exception:
-        log.exception("查詢機器人 userId 失敗")
-    return _bot_user_id
+        log.exception("查詢機器人資訊失敗")
+    return _bot_info
 
 
 def _is_mentioned(event: MessageEvent) -> bool:
-    """群組／聊天室中，只有標註機器人才回覆。"""
+    """群組／聊天室中，只有標註「本機器人」才回覆；標註其他人不回。"""
     message = event.message
-    bot_id = _get_bot_user_id()
+    bot_id, bot_name = _get_bot_info()
     mention = getattr(message, "mention", None)
     mentionees = getattr(mention, "mentionees", None) if mention else None
-    if mentionees:
+    if mentionees and bot_id:
         for m in mentionees:
             uid = getattr(m, "user_id", None) or getattr(m, "userId", None)
-            if uid and (uid == bot_id or bot_id is None):
+            if uid and uid == bot_id:
                 return True
-    # 部分訊息的 mention 結構缺少 userId（或使用者手打 @）：
-    # 一律再以文字中有無「@」判斷，避免誤判漏回
+    # 手打 @ 或 mention 資料缺少 userId 時：
+    # 只有文字中明確叫到「@機器人名稱」才算，避免標註其他人也觸發
     text = getattr(message, "text", "") or ""
-    return "@" in text
+    if bot_name:
+        return "@" + bot_name in text
+    return False
 
 
 def _reply(reply_token: str, text: str) -> None:
