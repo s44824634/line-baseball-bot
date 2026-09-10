@@ -63,7 +63,8 @@ def _mlb_scores(now_tp: datetime) -> list[str]:
 
 def _cpbl_scores(now_tp: datetime) -> list[str]:
     today = now_tp.date().isoformat()
-    games = [g for g in cpbl_mod._all_games(now_tp.year)
+    # 用「即時抓取」版本：賽程資料雖可快取，但 IsPlayBall/比分會隨比賽變動
+    games = [g for g in cpbl_mod._all_games_fresh(now_tp.year)
              if cpbl_mod._iso(g.get("GameDate") or "") == today]
     games.sort(key=lambda g: g.get("GameDate") or "")
     lines = []
@@ -88,16 +89,19 @@ _NPB_ZH = {std: zh for _short, (std, zh) in npb_mod.JP_TEAMS.items()}
 def _npb_scores(now_tp: datetime) -> list[str]:
     today = now_tp.date().isoformat()
     lines = []
-    for g in npb_mod._cards_for_date(today):
+    # 即時抓取：_cards_for_date 有整日快取，開賽後狀態會停在未開賽
+    for g in npb_mod._fetch_cards(today):
         away = _NPB_ZH.get(g["away"], g["away"])
         home = _NPB_ZH.get(g["home"], g["home"])
         status = g.get("status") or "予定"
         asc, hsc = g.get("away_score"), g.get("home_score")
-        if asc is not None and hsc is not None:
-            if status == "終了":
-                lines.append(f"🏁 終場｜{away} {asc} : {hsc} {home}")
-            else:
-                lines.append(f"🔴 {status}｜{away} {asc} : {hsc} {home}")
+        if status == "進行中":
+            inn = f" {g['inning']}" if g.get("inning") else ""
+            lines.append(f"🔴 進行中{inn}｜{away} {asc} : {hsc} {home}")
+        elif status == "終了":
+            lines.append(f"🏁 終場｜{away} {asc} : {hsc} {home}")
+        elif status == "中止":
+            lines.append(f"🚫 取消｜{away} @ {home}")
         elif status == "予定":
             lines.append(f"🕐 {g.get('time') or ''}｜{away} @ {home}")
         else:

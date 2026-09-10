@@ -51,8 +51,7 @@ def _iso(d: str) -> str:
     return str(d)[:10].replace("/", "-")
 
 
-@lru_cache(maxsize=4)
-def _season_games(year: int, kind_code: str) -> list[dict]:
+def _fetch_season_games(year: int, kind_code: str) -> list[dict]:
     s = requests.Session()
     s.headers.update(_HEADERS)
     page = s.get(_PAGE_URL, timeout=15)
@@ -74,6 +73,12 @@ def _season_games(year: int, kind_code: str) -> list[dict]:
     return _json.loads(resp.json()["GameDatas"])
 
 
+@lru_cache(maxsize=4)
+def _season_games(year: int, kind_code: str) -> list[dict]:
+    """分析用（可快取）；比賽狀態欄位以抓當下為準，僅供賽前資料。"""
+    return _fetch_season_games(year, kind_code)
+
+
 def _all_games(year: int) -> list[dict]:
     """例行賽 + 季後挑戰賽 + 總冠軍賽。"""
     games: list[dict] = []
@@ -82,6 +87,17 @@ def _all_games(year: int) -> list[dict]:
             games.extend(_season_games(year, kind))
         except Exception:
             log.warning("CPBL kindCode=%s 取得失敗", kind)
+    return games
+
+
+def _all_games_fresh(year: int) -> list[dict]:
+    """即時比分用：不經快取即時抓取（比賽狀態隨時變動，快取會 stale）。"""
+    games: list[dict] = []
+    for kind in ("A", "E", "C"):
+        try:
+            games.extend(_fetch_season_games(year, kind))
+        except Exception:
+            log.warning("CPBL kindCode=%s 即時取得失敗", kind)
     return games
 
 

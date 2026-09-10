@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 
@@ -24,6 +24,8 @@ from app.leagues.base import GameInfo, LeagueProvider
 from app.weather import fetch_weather, roof_status
 
 log = logging.getLogger("npb")
+
+TAIPEI = timezone(timedelta(hours=8))
 
 H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"}
@@ -133,12 +135,21 @@ def _standings(year: int) -> dict[str, dict]:
 
 @lru_cache(maxsize=16)
 def _cards_for_date(day_iso: str) -> list[dict]:
-    """Yahoo 指定日期的比賽卡片（含球場、先發投手）。
+    """分析用（可快取）；即時比分請改用 `_fetch_cards`。"""
+    return _fetch_cards(day_iso)
+
+
+def _fetch_cards(day_iso: str) -> list[dict]:
+    """Yahoo 指定日期的比賽卡片（含球場、先發投手、比分與狀態）。
 
     Yahoo 僅「今日」的卡片資料完整正確；未來日期的卡片對戰組合
     可信，但球場欄位可能錯位，故僅今日保留球場資訊。
+
+    即時狀態（進行中／終了／比分）不經快取：Yahoo 卡片在
+    未開賽時狀態欄為「18:00」格式，開賽後改為比分＋「8回裏」，
+    一旦快取整日，開賽後狀態會停在未開賽。
     """
-    trusted = day_iso == date.today().isoformat()
+    trusted = day_iso == datetime.now(TAIPEI).date().isoformat()
     url = f"https://baseball.yahoo.co.jp/npb/schedule/?date={day_iso}"
     r = requests.get(url, timeout=15, headers=H)
     r.encoding = r.apparent_encoding
@@ -149,6 +160,7 @@ def _cards_for_date(day_iso: str) -> list[dict]:
         if not a:
             continue
         gid = re.search(r"/npb/game/(\d+)/", a["href"]).group(1)
+        li_cls = " ".join(li.get("class", []))
 
         def team_of(css):
             p = li.select_one(css)
@@ -170,16 +182,41 @@ def _cards_for_date(day_iso: str) -> list[dict]:
             continue
         venue_el = li.select_one(".bb-score__venue")
         time_el = li.select_one(".bb-score__status")
+        link_el = li.select_one(".bb-score__link")
         ttxt = time_el.get_text(strip=True) if time_el else ""
         tm = re.fullmatch(r"(\d{1,2}):(\d{2})", ttxt)
-        status = "予定" if tm else (ttxt or "予定")
+        link_txt = link_el.get_text(strip=True) if link_el else ""
 
-        def _score(css):
-            el = li.select_one(css)
-            if not el:
-                return None
-            t = el.get_text(strip=True)
-            return int(t) if t.isdigit() else None
+        def _score(*css_list):
+            for css in css_list:
+                el = li.select_one(css)
+                if not el:
+                    continue
+                t = el.get_text(strip=True)
+                if t.isdigit():
+                    return int(t)
+            return None
+
+        # Yahoo 卡片左=主隊、右=客隊（依 2026-09-10 實際比分交叉驗證：
+        # 樂天@羅德 卡片「6-1」對應 樂天 1:6 羅德）
+        away_score = _score(".bb-score__scoreAway", ".bb-score__score--right")
+        home_score = _score(".bb-score__scoreHome", ".bb-score__score--left")
+
+        inning = None
+        m_inn = re.match(r"(\d+)回(表|裏)", link_txt)
+        if m_inn:
+            inning = f"{m_inn.group(1)}局{'上' if m_inn.group(2) == '表' else '下'}"
+
+        if tm:
+            status = "予定"
+        elif "bb-score__item--live" in li_cls or inning:
+            status = "進行中"
+        elif "中止" in link_txt:
+            status = "中止"
+        elif "終了" in link_txt:
+            status = "終了"
+        else:
+            status = link_txt or "予定"
 
         def starter(css):
             el = li.select_one(css)
@@ -194,9 +231,9 @@ def _cards_for_date(day_iso: str) -> list[dict]:
             "time": tm.group(0) if tm else None,
             "stadium": venue_el.get_text(strip=True) if (venue_el and trusted)
                        else None,
-            "game_id": gid, "status": status,
-            "away_score": _score(".bb-score__scoreAway"),
-            "home_score": _score(".bb-score__scoreHome"),
+            "game_id": gid, "status": status, "inning": inning,
+            "away_score": away_score,
+            "home_score": home_score,
             "away_starter": starter(".bb-score__playerAway"),
             "home_starter": starter(".bb-score__playerHome"),
         })
