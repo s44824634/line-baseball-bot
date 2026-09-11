@@ -162,7 +162,7 @@ def health() -> dict:
 
 @app.get("/api/groups")
 def api_groups() -> dict:
-    """已註冊的群組（事件推播對象）。僅供設定時確認用。"""
+    """已註冊的群組與推播開關狀態。僅供設定時確認用。"""
     from app import pusher
     return {"groups": pusher.known_groups()}
 
@@ -187,6 +187,7 @@ async def callback(request: Request) -> str:
     for event in events:
         if not isinstance(event, MessageEvent):
             continue
+        register_id = None
         # 群組／聊天室：註冊 group_id（事件推播用），且只在被標註時回覆
         if event.source.type in ("group", "room"):
             from app import pusher
@@ -208,6 +209,23 @@ async def callback(request: Request) -> str:
                 continue
             text = event.message.text.strip()
             log.info("收到訊息（%s）：%s", event.source.type, text)
+            if "開啟自動推播" in text or "開啟自動推送" in text:
+                if not register_id:
+                    _reply(event.reply_token,
+                           "請在「群組裡」輸入這個指令（@機器人 開啟自動推播）。")
+                    continue
+                from app import pusher
+                pusher.set_enabled(register_id, True)
+                _reply(event.reply_token,
+                       "✅ 已開啟自動推播！\n"
+                       "之後得分／全壘打／終場（NBA 為每節結束）"
+                       "會自動發到這個群組。\n"
+                       "輸入「@機器人 關閉自動推播」可停止。")
+            elif "關閉自動推播" in text or "關閉自動推送" in text:
+                if register_id:
+                    from app import pusher
+                    pusher.set_enabled(register_id, False)
+                _reply(event.reply_token, "已關閉自動推播。")
             if text.lower() in ("help", "幫助", "使用說明", "?", "？", "選單"):
                 _reply(event.reply_token, HELP_TEXT)
             elif SCORE_PATTERN.search(text):

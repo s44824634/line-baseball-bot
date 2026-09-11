@@ -1,14 +1,15 @@
 """重要事件自動推播 — 得分／全壘打／終場 → LINE 群組。
 
 背景工作（FastAPI startup 啟動）：
-- 每 POLL_SEC 秒掃描 MLB 即時比賽（官方 Stats API，免費無鑰匙）
-- 以 scoringPlays 索引比對，找出「新發生的得分事件」（含全壘打）
-- 同一場比賽同一輪的新事件合併成一則訊息推播到所有已知群組
-- 比賽轉為 Final 推一次終場比分
-- 每日推播上限（LINE 免費額度 200 則/月）以防爆量
+- 每 POLL_SEC 秒掃描各聯盟即時比賽
+  - MLB：官方 Stats API live feed，得分事件（含全壘打標記）+ 終場
+  - NPB／CPBL／KBO：比分變化（得分）+ 終場
+  - NBA：每節結束比分 + 終場（NBA 僅球季期間有資料）
+- 同一場比賽同一輪的新事件合併成一則訊息推播
+- 只推給「已開啟推播」的群組：群組中輸入「@機器人 開啟自動推播」
 
-群組註冊：機器人收到群組訊息時自動記住 group_id，
-並持久化到 data/known_groups.json（Render 重啟後仍保留）。
+群組與開關狀態持久化到 data/push_settings.json。
+資料來源：MLB Stats API（官方）、CPBL 官方、Yahoo! プロ野球、ESPN。
 """
 from __future__ import annotations
 
@@ -16,136 +17,95 @@ import asyncio
 import json
 import logging
 import os
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
 from app.data import mlb as statsapi
+from app.scores import _NPB_ZH
 
 log = logging.getLogger("pusher")
 TAIPEI = timezone(timedelta(hours=8))
 
 POLL_SEC = int(os.environ.get("PUSH_POLL_SEC", "45"))
-# LINE 免費方案每月僅 200 則推播（回覆不限）：
-# MLB 一晚可能數十個得分事件，預設每日上限 50，可依需求用環境變數調整
-DAILY_LIMIT = int(os.environ.get("PUSH_DAILY_LIMIT", "50"))
-_GROUPS_FILE = Path(__file__).resolve().parent.parent / "data" / "known_groups.json"
+# 0 = 不設上限（使用者方案無訊息限制）；可用環境變數重新啟用
+DAILY_LIMIT = int(os.environ.get("PUSH_DAILY_LIMIT", "0"))
+_SETTINGS = Path(__file__).resolve().parent.parent / "data" / "push_settings.json"
 
-# gamePk → {"seen": set[int], "final": bool}
-_seen: dict[int, dict] = {}
-_groups: set[str] = set()
-_day = ""
-_count = 0
+# 比賽狀態：key → {"last": tuple|int|None, "final": bool}
+_state: dict[str, dict] = {}
+_settings_data: dict = {"groups": {}}
 
 
-# ---------------------------------------------------------------- 群組註冊
-def load_groups() -> None:
-    global _groups
+# ---------------------------------------------------------------- 設定
+def _save() -> None:
     try:
-        if _GROUPS_FILE.exists():
-            _groups = set(json.loads(_GROUPS_FILE.read_text(encoding="utf-8")))
-            log.info("已載入 %d 個已知群組", len(_groups))
+        _SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        _SETTINGS.write_text(
+            json.dumps(_settings_data, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        log.exception("載入群組清單失敗")
+        log.exception("儲存推播設定失敗")
 
 
-def register_group(group_id: str | None) -> None:
-    if not group_id or group_id in _groups:
-        return
-    _groups.add(group_id)
+def load_settings() -> None:
+    global _settings_data
     try:
-        _GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _GROUPS_FILE.write_text(json.dumps(sorted(_groups)), encoding="utf-8")
+        if _SETTINGS.exists():
+            _settings_data = json.loads(
+                _SETTINGS.read_text(encoding="utf-8"))
+            log.info("已載入推播設定：%d 群組",
+                     len(_settings_data.get("groups", {})))
     except Exception:
-        log.exception("儲存群組清單失敗")
+        log.exception("載入推播設定失敗")
+
+
+def register_group(group_id: str | None) -> bool:
+    """登記群組（預設關閉推播）。回傳是否為新群組。"""
+    if not group_id:
+        return False
+    g = _settings_data.setdefault("groups", {})
+    if group_id in g:
+        return False
+    g[group_id] = {"enabled": False}
+    _save()
     log.info("註冊新群組：%s", group_id)
+    return True
 
 
-def known_groups() -> list[str]:
-    return sorted(_groups)
+def set_enabled(group_id: str | None, enabled: bool) -> bool:
+    if not group_id:
+        return False
+    g = _settings_data.setdefault("groups", {})
+    if group_id not in g:
+        g[group_id] = {}
+    g[group_id]["enabled"] = enabled
+    _save()
+    return True
 
 
-# ---------------------------------------------------------------- 事件解析
-def _fetch_events(game_pk: int) -> dict | None:
-    """MLB live feed → 當前比分、狀態、全部得分事件（含全壘打標記）。"""
-    try:
-        r = requests.get(
-            f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
-            timeout=15)
-        r.raise_for_status()
-        feed = r.json()
-    except Exception:
-        log.exception("抓不到 feed：%s", game_pk)
-        return None
-    ls = feed.get("liveData", {}).get("linescore", {})
-    plays = feed.get("liveData", {}).get("plays", {})
-    all_plays = plays.get("allPlays", [])
-    gd = feed.get("gameData", {})
-    away = statsapi._zh_team(gd.get("teams", {}).get("away", {}))
-    home = statsapi._zh_team(gd.get("teams", {}).get("home", {}))
-    state = (gd.get("status", {}) or {}).get("abstractGameState", "")
-
-    events = []
-    for idx in plays.get("scoringPlays", []):
-        if not (0 <= idx < len(all_plays)):
-            continue
-        p = all_plays[idx]
-        about = p.get("about", {})
-        result = p.get("result", {})
-        batter = (p.get("matchup", {}) or {}).get("batter", {}) or {}
-        ev_txt = (result.get("event") or "").lower()
-        events.append({
-            "idx": idx,
-            "inning": f"{about.get('inning', '?')}局"
-                      f"{'上' if about.get('halfInning') == 'top' else '下'}",
-            "desc": result.get("description", ""),
-            "batter": batter.get("fullName", ""),
-            "hr": result.get("type") == "home_run" or "home run" in ev_txt,
-            "rbi": result.get("rbi", 0),
-        })
-    return {
-        "state": state, "away": away, "home": home,
-        "away_score": (ls.get("teams", {}).get("away", {}) or {}).get("runs"),
-        "home_score": (ls.get("teams", {}).get("home", {}) or {}).get("runs"),
-        "events": events,
-    }
+def enabled_groups() -> list[str]:
+    return sorted(gid for gid, s in _settings_data.get("groups", {}).items()
+                  if s.get("enabled"))
 
 
-def _fmt_events(info: dict, evs: list[dict]) -> str:
-    sa, sh = info.get("away_score"), info.get("home_score")
-    head = f"{info['away']} {sa} : {sh} {info['home']}"
-    lines = []
-    for ev in evs:
-        mark = "🎆 全壘打" if ev["hr"] else "⚾ 得分"
-        lines.append(f"{mark} {ev['inning']}｜{head}")
-        who = ev["batter"] or ""
-        if who:
-            who += f" {ev['rbi']}分打點" if ev.get("rbi") else ""
-        if who:
-            lines.append(f"　{who}")
-    lines.append("　" + (evs[-1].get("desc") or "")[:120])
-    return "\n".join(lines)
-
-
-def _fmt_final(info: dict) -> str:
-    return (f"🏁 MLB 終場｜{info['away']} {info.get('away_score')} : "
-            f"{info.get('home_score')} {info['home']}")
+def known_groups() -> dict:
+    return {gid: s.get("enabled", False)
+            for gid, s in _settings_data.get("groups", {}).items()}
 
 
 # ---------------------------------------------------------------- 推播
 def _push(text: str) -> bool:
-    """推播到所有已知群組，受每日上限管制。回傳是否有實際送出。"""
-    global _day, _count
+    groups = enabled_groups()
+    if not groups:
+        log.info("（無已開啟推播的群組，僅記錄）\n%s", text)
+        return False
+    global _count, _day
     today = datetime.now(TAIPEI).strftime("%Y-%m-%d")
     if today != _day:
         _day, _count = today, 0
-    if not _groups:
-        log.info("（無已知群組，以下僅記錄不推送）\n%s", text)
-        return False
-    if _count >= DAILY_LIMIT:
-        log.warning("已達每日推播上限 %d，略過：%s", DAILY_LIMIT, text[:40])
+    if DAILY_LIMIT and _count >= DAILY_LIMIT:
+        log.warning("已達每日推播上限 %d，略過", DAILY_LIMIT)
         return False
     try:
         from linebot.v3.messaging import (
@@ -158,7 +118,7 @@ def _push(text: str) -> bool:
     ok = False
     with ApiClient(configuration) as client:
         api = MessagingApi(client)
-        for gid in _groups:
+        for gid in groups:
             try:
                 api.push_message(PushMessageRequest(
                     to=gid, messages=[TextMessage(text=text)]))
@@ -170,8 +130,51 @@ def _push(text: str) -> bool:
     return ok
 
 
-def check_once() -> int:
-    """掃描一次所有 Live 比賽並推播新事件，回傳推播則數。"""
+_count = 0
+_day = ""
+
+
+# ---------------------------------------------------------------- MLB
+def _fetch_mlb_events(game_pk: int) -> dict | None:
+    try:
+        r = requests.get(
+            f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+            timeout=15)
+        r.raise_for_status()
+        feed = r.json()
+    except Exception:
+        return None
+    plays = feed.get("liveData", {}).get("plays", {})
+    all_plays = plays.get("allPlays", [])
+    ls = feed.get("liveData", {}).get("linescore", {})
+    gd = feed.get("gameData", {})
+    events = []
+    for idx in plays.get("scoringPlays", []):
+        if not (0 <= idx < len(all_plays)):
+            continue
+        p = all_plays[idx]
+        about = p.get("about", {})
+        result = p.get("result", {})
+        ev_txt = (result.get("event") or "").lower()
+        events.append({
+            "idx": idx,
+            "inning": f"{about.get('inning', '?')}局"
+                      f"{'上' if about.get('halfInning') == 'top' else '下'}",
+            "batter": (p.get("matchup", {}) or {}).get("batter", {}).get("fullName", ""),
+            "hr": result.get("type") == "home_run" or "home run" in ev_txt,
+            "rbi": result.get("rbi", 0),
+        })
+    return {
+        "state": (gd.get("status", {}) or {}).get("abstractGameState", ""),
+        "away": statsapi._zh_team(gd.get("teams", {}).get("away", {})),
+        "home": statsapi._zh_team(gd.get("teams", {}).get("home", {})),
+        "away_score": (ls.get("teams", {}).get("away", {}) or {}).get("runs"),
+        "home_score": (ls.get("teams", {}).get("home", {}) or {}).get("runs"),
+        "events": events,
+    }
+
+
+def check_mlb() -> list[str]:
     now_tp = datetime.now(TAIPEI)
     today_utc = now_tp.astimezone(timezone.utc).date()
     try:
@@ -182,38 +185,221 @@ def check_once() -> int:
             "gameTypes": "R", "hydrate": "linescore",
         })
     except Exception:
-        log.exception("取得賽程失敗")
-        return 0
-    pushed = 0
+        return []
+    msgs = []
     for d in data.get("dates", []):
         for g in d.get("games", []):
-            if (g.get("status") or {}).get("abstractGameState") != "Live":
-                continue
+            state = (g.get("status") or {}).get("abstractGameState")
             pk = g["gamePk"]
-            info = _fetch_events(pk)
+            # Live 一定追蹤；Final 只有「先前追蹤過」的才補推終場
+            if state != "Live" and not (state == "Final" and f"mlb:{pk}" in _state):
+                continue
+            info = _fetch_mlb_events(pk)
             if not info:
                 continue
-            st = _seen.setdefault(pk, {"seen": set(), "final": False})
+            st = _state.setdefault(f"mlb:{pk}", {"seen": set(), "final": False})
             new_evs = [e for e in info["events"] if e["idx"] not in st["seen"]]
             if new_evs:
                 st["seen"].update(e["idx"] for e in new_evs)
-                if _push(_fmt_events(info, new_evs)):
-                    pushed += 1
+                msgs.append(_fmt_mlb_events(info, new_evs))
             if info["state"] == "Final" and not st["final"]:
                 st["final"] = True
-                if _push(_fmt_final(info)):
-                    pushed += 1
-    # 清掉已完賽超過一天的狀態
-    if len(_seen) > 40:
-        for pk in [k for k, v in _seen.items() if v["final"]][:-20]:
-            _seen.pop(pk, None)
+                msgs.append(f"🏁 MLB 終場｜{info['away']} {info['away_score']} : "
+                            f"{info['home_score']} {info['home']}")
+    return msgs
+
+
+def _fmt_mlb_events(info: dict, evs: list[dict]) -> str:
+    head = f"{info['away']} {info['away_score']} : {info['home_score']} {info['home']}"
+    lines = []
+    for ev in evs:
+        mark = "🎆 全壘打" if ev["hr"] else "⚾ 得分"
+        who = ev["batter"] or ""
+        if who and ev.get("rbi"):
+            who += f" {ev['rbi']}分打點"
+        lines.append(f"{mark} {ev['inning']}｜{head}")
+        if who:
+            lines.append(f"　{who}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- NPB / CPBL / KBO / NBA
+def _score_change_msgs(league: str, games: list[dict]) -> list[str]:
+    """通用比分變化偵測：games = [{key, away, home, a, h, state, extra}]。"""
+    msgs = []
+    for g in games:
+        st = _state.setdefault(f"{league}:{g['key']}",
+                               {"last": None, "final": False})
+        score = (g["a"], g["h"])
+        if g["state"] in ("live", "進行中"):
+            if st["last"] is not None and score != st["last"] and \
+                    None not in score:
+                msgs.append(
+                    f"⚾ 得分 {g.get('extra', '')}｜{g['away']} {g['a']} : "
+                    f"{g['h']} {g['home']}")
+            st["last"] = score
+        elif g["state"] in ("final", "終了") and not st["final"]:
+            st["final"] = True
+            msgs.append(f"🏁 {league.upper()} 終場｜{g['away']} {g['a']} : "
+                        f"{g['h']} {g['home']}")
+        elif g["state"] in ("cancel", "中止") and not st["final"]:
+            st["final"] = True
+            msgs.append(f"🚫 {league.upper()} 取消｜{g['away']} @ {g['home']}")
+    return msgs
+
+
+def check_npb() -> list[str]:
+    from app.leagues import npb as npb_mod
+    today = datetime.now(TAIPEI).date().isoformat()
+    try:
+        cards = npb_mod._fetch_cards(today)
+    except Exception:
+        return []
+    games = [{
+        "key": f"{today}:{c['game_id']}",
+        "away": _NPB_ZH.get(c["away"], c["away"]),
+        "home": _NPB_ZH.get(c["home"], c["home"]),
+        "a": c.get("away_score"), "h": c.get("home_score"),
+        "state": {"進行中": "live", "終了": "final", "中止": "cancel"}.get(
+            c.get("status"), "pre"),
+        "extra": c.get("inning") or "",
+    } for c in cards]
+    return _score_change_msgs("npb", games)
+
+
+def check_cpbl() -> list[str]:
+    from app.leagues import cpbl as cpbl_mod
+    now_tp = datetime.now(TAIPEI)
+    today = now_tp.date().isoformat()
+    try:
+        games_all = cpbl_mod._all_games_fresh(now_tp.year)
+    except Exception:
+        return []
+    games = []
+    for g in games_all:
+        if cpbl_mod._iso(g.get("GameDate") or "") != today:
+            continue
+        vs, hs = g.get("VisitingScore"), g.get("HomeScore")
+        try:
+            vs = int(vs) if vs is not None else None
+            hs = int(hs) if hs is not None else None
+        except (TypeError, ValueError):
+            vs = hs = None
+        finished = bool(g.get("GameDateTimeE"))
+        state = "final" if finished else \
+            ("live" if str(g.get("IsPlayBall") or "").upper() == "Y" else "pre")
+        games.append({
+            "key": f"{today}:{g.get('GameSno') or g.get('GameDateTime')}",
+            "away": g["VisitingTeamName"], "home": g["HomeTeamName"],
+            "a": vs, "h": hs, "state": state, "extra": "",
+        })
+    return _score_change_msgs("cpbl", games)
+
+
+# ESPN 共用（KBO / NBA）
+def _espn_scoreboard(sport_path: str) -> list[dict]:
+    r = requests.get(
+        f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard",
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    r.raise_for_status()
+    return r.json().get("events", [])
+
+
+def check_kbo() -> list[str]:
+    try:
+        events = _espn_scoreboard("baseball/kbo")
+    except Exception:
+        log.warning("KBO（ESPN）取得失敗")
+        return []
+    games = []
+    for e in events:
+        comp = e.get("competitions", [{}])[0]
+        status = e.get("status", {}) or {}
+        stype = (status.get("type") or {})
+        state_map = {"in": "live", "post": "final", "pre": "pre"}
+        state = state_map.get(stype.get("state"), "pre")
+        teams = {}
+        for c in comp.get("competitors", []):
+            teams[c.get("homeAway")] = c
+        try:
+            away = teams["away"]["team"].get("shortDisplayName", "?")
+            home = teams["home"]["team"].get("shortDisplayName", "?")
+            a = teams["away"].get("score")
+            h = teams["home"].get("score")
+        except KeyError:
+            continue
+        games.append({
+            "key": f"kbo:{e.get('id')}", "away": away, "home": home,
+            "a": int(a) if a is not None else None,
+            "h": int(h) if h is not None else None,
+            "state": state,
+            "extra": stype.get("shortDetail") or "",
+        })
+    return _score_change_msgs("kbo", games)
+
+
+def check_nba() -> list[str]:
+    """NBA：每節結束推比分、終場推結果（不推每次得分，太頻繁）。"""
+    try:
+        events = _espn_scoreboard("basketball/nba")
+    except Exception:
+        log.warning("NBA（ESPN）取得失敗")
+        return []
+    msgs = []
+    for e in events:
+        comp = e.get("competitions", [{}])[0]
+        status = e.get("status", {}) or {}
+        stype = (status.get("type") or {})
+        state = stype.get("state")
+        period = status.get("period", 0) or 0
+        completed = bool(stype.get("completed"))
+        key = f"nba:{e.get('id')}"
+        st = _state.setdefault(key, {"period": 0, "final": False})
+        teams = {}
+        for c in comp.get("competitors", []):
+            teams[c.get("homeAway")] = c
+        try:
+            away = teams["away"]["team"].get("shortDisplayName", "?")
+            home = teams["home"]["team"].get("shortDisplayName", "?")
+            a = int(teams["away"].get("score") or 0)
+            h = int(teams["home"].get("score") or 0)
+        except (KeyError, ValueError):
+            continue
+        if state == "in" and period > st["period"]:
+            # 新節開始 = 上一節結束
+            q = st["period"] or 1
+            if st["period"] > 0:
+                msgs.append(f"🏀 NBA 第{q}節結束｜{away} {a} : {h} {home}")
+            st["period"] = period
+        if completed and not st["final"]:
+            st["final"] = True
+            msgs.append(f"🏁 NBA 終場｜{away} {a} : {h} {home}")
+    return msgs
+
+
+# ---------------------------------------------------------------- 主迴圈
+def check_once() -> int:
+    msgs: list[str] = []
+    for fn in (check_mlb, check_npb, check_cpbl, check_kbo, check_nba):
+        try:
+            msgs.extend(fn())
+        except Exception:
+            log.exception("%s 掃描失敗", fn.__name__)
+    pushed = 0
+    for m in msgs:
+        if _push(m):
+            pushed += 1
+    if len(_state) > 200:
+        done = [k for k, v in _state.items()
+                if v.get("final") or v.get("last") is None]
+        for k in done[:-100]:
+            _state.pop(k, None)
     return pushed
 
 
 async def loop() -> None:
-    """背景主迴圈（FastAPI startup 啟動）。"""
-    load_groups()
-    await asyncio.sleep(10)  # 等伺服器完全起來
+    load_settings()
+    await asyncio.sleep(10)
     while True:
         try:
             check_once()
