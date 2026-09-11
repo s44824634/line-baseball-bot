@@ -194,7 +194,14 @@ async def callback(request: Request) -> str:
             register_id = getattr(event.source, "group_id", None) or \
                 getattr(event.source, "room_id", None)
             pusher.register_group(register_id)
-            mentioned = _is_mentioned(event)
+            raw_text = event.message.text if isinstance(
+                event.message, TextMessageContent) else ""
+            # 推播開關是指令操作：即使 mention 結構異常（例如使用者自訂暱稱）
+            # 只要文字明確包含指令就接受，其餘訊息仍維持「只回應標註本機器人」
+            is_push_cmd = any(k in raw_text for k in
+                              ("開啟自動推播", "開啟自動推送",
+                               "關閉自動推播", "關閉自動推送"))
+            mentioned = _is_mentioned(event) or is_push_cmd
             snippet = ""
             if isinstance(event.message, TextMessageContent):
                 snippet = event.message.text[:30]
@@ -216,11 +223,12 @@ async def callback(request: Request) -> str:
                     continue
                 from app import pusher
                 pusher.set_enabled(register_id, True)
+                _bot_name = _get_bot_info()[1] or "機器人"
                 _reply(event.reply_token,
                        "✅ 已開啟自動推播！\n"
                        "之後得分／全壘打／終場（NBA 為每節結束）"
                        "會自動發到這個群組。\n"
-                       "輸入「@機器人 關閉自動推播」可停止。")
+                       f"輸入「@{_bot_name} 關閉自動推播」可停止。")
             elif "關閉自動推播" in text or "關閉自動推送" in text:
                 if register_id:
                     from app import pusher
