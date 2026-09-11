@@ -35,6 +35,10 @@ CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 
 app = FastAPI(title="LINE 棒球賽前分析機器人")
+
+from app.board import router as board_router  # noqa: E402  (路由模組)
+app.include_router(board_router)
+
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(CHANNEL_SECRET)
 
