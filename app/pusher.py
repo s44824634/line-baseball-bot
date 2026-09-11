@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -296,82 +297,113 @@ def check_cpbl() -> list[str]:
     return _score_change_msgs("cpbl", games)
 
 
-# ESPN 共用（KBO / NBA）
-def _espn_scoreboard(sport_path: str) -> list[dict]:
-    r = requests.get(
-        f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard",
-        headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-    r.raise_for_status()
-    return r.json().get("events", [])
+# KBO 官方（www.koreabaseball.com，需先造訪頁面取得 session 再帶 Referer 呼叫）
+KBO_TEAMS_ZH = {
+    "키움": "培證英雄", "삼성": "三星獅", "KT": "KT巫師", "롯데": "樂天巨人",
+    "SSG": "SSG登陸者", "KIA": "KIA虎", "NC": "NC恐龍", "한화": "韓華鷹",
+    "LG": "LG雙子", "두산": "斗山熊",
+}
+_kbo_session: requests.Session | None = None
+_kbo_session_at = 0.0
+
+
+def _kbo_games(date_yyyymmdd: str) -> list[dict]:
+    global _kbo_session, _kbo_session_at
+    H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+    try:
+        if _kbo_session is None or time.time() - _kbo_session_at > 600:
+            _kbo_session = requests.Session()
+            _kbo_session.headers.update(H)
+            _kbo_session.get(
+                "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx",
+                timeout=20)
+            _kbo_session_at = time.time()
+        r = _kbo_session.post(
+            "https://www.koreabaseball.com/ws/Main.asmx/GetKboGameList",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx",
+            },
+            data={"leId": "1", "srId": "0,1,3,4,5,6,7,9", "date": date_yyyymmdd},
+            timeout=20)
+        return r.json().get("game", [])
+    except Exception:
+        log.warning("KBO 官方 API 取得失敗")
+        return []
 
 
 def check_kbo() -> list[str]:
-    try:
-        events = _espn_scoreboard("baseball/kbo")
-    except Exception:
-        log.warning("KBO（ESPN）取得失敗")
-        return []
+    """KBO：官方 GameCenter API。狀態碼 1=未開賽 2=進行中 3=完賽。"""
+    date = datetime.now(TAIPEI).strftime("%Y%m%d")
     games = []
-    for e in events:
-        comp = e.get("competitions", [{}])[0]
-        status = e.get("status", {}) or {}
-        stype = (status.get("type") or {})
-        state_map = {"in": "live", "post": "final", "pre": "pre"}
-        state = state_map.get(stype.get("state"), "pre")
-        teams = {}
-        for c in comp.get("competitors", []):
-            teams[c.get("homeAway")] = c
+    for g in _kbo_games(date):
+        state_sc = str(g.get("GAME_STATE_SC") or "1")
+        cancel = str(g.get("CANCEL_SC_ID") or "0")
+        if cancel != "0":
+            state = "cancel"
+        else:
+            state = {"1": "pre", "2": "live", "3": "final"}.get(state_sc, "pre")
+        inn = g.get("GAME_INN_NO")
+        tb = (g.get("GAME_TB_SC_NM") or "")
+        extra = ""
+        if state == "live" and inn:
+            extra = f"{inn}局{'上' if tb == '초' else '下'}"
         try:
-            away = teams["away"]["team"].get("shortDisplayName", "?")
-            home = teams["home"]["team"].get("shortDisplayName", "?")
-            a = teams["away"].get("score")
-            h = teams["home"].get("score")
-        except KeyError:
-            continue
+            a = int(g.get("T_SCORE_CN"))
+            h = int(g.get("B_SCORE_CN"))
+        except (TypeError, ValueError):
+            a = h = None
         games.append({
-            "key": f"kbo:{e.get('id')}", "away": away, "home": home,
-            "a": int(a) if a is not None else None,
-            "h": int(h) if h is not None else None,
-            "state": state,
-            "extra": stype.get("shortDetail") or "",
+            "key": f"kbo:{g.get('G_ID')}",
+            "away": KBO_TEAMS_ZH.get(g.get("AWAY_NM", ""), g.get("AWAY_NM", "?")),
+            "home": KBO_TEAMS_ZH.get(g.get("HOME_NM", ""), g.get("HOME_NM", "?")),
+            "a": a, "h": h, "state": state, "extra": extra,
         })
     return _score_change_msgs("kbo", games)
 
 
+# NBA：Sofascore 公開 API（ESPN / NBA 官方 CDN 對伺服器端均封鎖）
+NBA_TOURNAMENT_ID = 138  # Sofascore uniqueTournament id
+
+
 def check_nba() -> list[str]:
     """NBA：每節結束推比分、終場推結果（不推每次得分，太頻繁）。"""
+    date = datetime.now(TAIPEI).date().isoformat()
     try:
-        events = _espn_scoreboard("basketball/nba")
+        r = requests.get(
+            f"https://www.sofascore.com/api/v1/sport/basketball/"
+            f"scheduled-events/{date}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        items = r.json().get("events", [])
     except Exception:
-        log.warning("NBA（ESPN）取得失敗")
+        log.warning("NBA（Sofascore）取得失敗")
         return []
     msgs = []
-    for e in events:
-        comp = e.get("competitions", [{}])[0]
+    for item in items:
+        e = item.get("event", item)
+        ut = (e.get("tournament", {}) or {}).get("uniqueTournament", {}) or {}
+        if ut.get("id") != NBA_TOURNAMENT_ID:
+            continue
         status = e.get("status", {}) or {}
-        stype = (status.get("type") or {})
-        state = stype.get("state")
-        period = status.get("period", 0) or 0
-        completed = bool(stype.get("completed"))
+        stype = status.get("type", "")
+        period = (e.get("time", {}) or {}).get("currentPeriod", 0) or 0
         key = f"nba:{e.get('id')}"
         st = _state.setdefault(key, {"period": 0, "final": False})
-        teams = {}
-        for c in comp.get("competitors", []):
-            teams[c.get("homeAway")] = c
         try:
-            away = teams["away"]["team"].get("shortDisplayName", "?")
-            home = teams["home"]["team"].get("shortDisplayName", "?")
-            a = int(teams["away"].get("score") or 0)
-            h = int(teams["home"].get("score") or 0)
-        except (KeyError, ValueError):
+            away = (e.get("awayTeam", {}) or {}).get("name", "?")
+            home = (e.get("homeTeam", {}) or {}).get("name", "?")
+            a = int((e.get("awayScore", {}) or {}).get("current") or 0)
+            h = int((e.get("homeScore", {}) or {}).get("current") or 0)
+        except (AttributeError, ValueError):
             continue
-        if state == "in" and period > st["period"]:
-            # 新節開始 = 上一節結束
-            q = st["period"] or 1
-            if st["period"] > 0:
-                msgs.append(f"🏀 NBA 第{q}節結束｜{away} {a} : {h} {home}")
+        if stype == "inprogress" and period > st["period"]:
+            if st["period"] > 0:  # 新節開始 = 上一節結束
+                msgs.append(f"🏀 NBA 第{st['period']}節結束｜{away} {a} : {h} {home}")
             st["period"] = period
-        if completed and not st["final"]:
+        elif stype == "finished" and not st["final"]:
             st["final"] = True
             msgs.append(f"🏁 NBA 終場｜{away} {a} : {h} {home}")
     return msgs
