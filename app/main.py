@@ -160,6 +160,21 @@ def health() -> dict:
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 
+@app.get("/api/groups")
+def api_groups() -> dict:
+    """已註冊的群組（事件推播對象）。僅供設定時確認用。"""
+    from app import pusher
+    return {"groups": pusher.known_groups()}
+
+
+@app.on_event("startup")
+async def _start_pusher() -> None:
+    """背景推播：得分／全壘打／終場自動發到已註冊群組。"""
+    import asyncio
+    from app import pusher
+    asyncio.create_task(pusher.loop())
+
+
 @app.post("/callback")
 async def callback(request: Request) -> str:
     signature = request.headers.get("X-Line-Signature", "")
@@ -172,8 +187,12 @@ async def callback(request: Request) -> str:
     for event in events:
         if not isinstance(event, MessageEvent):
             continue
-        # 群組／聊天室：只在被標註時回覆，其餘靜默
+        # 群組／聊天室：註冊 group_id（事件推播用），且只在被標註時回覆
         if event.source.type in ("group", "room"):
+            from app import pusher
+            register_id = getattr(event.source, "group_id", None) or \
+                getattr(event.source, "room_id", None)
+            pusher.register_group(register_id)
             mentioned = _is_mentioned(event)
             snippet = ""
             if isinstance(event.message, TextMessageContent):
