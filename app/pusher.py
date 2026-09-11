@@ -117,6 +117,9 @@ def _push(text: str) -> bool:
         log.exception("推播模組匯入失敗")
         return False
     ok = False
+    global _pause_until
+    if time.time() < _pause_until:
+        return False
     with ApiClient(configuration) as client:
         api = MessagingApi(client)
         for gid in groups:
@@ -124,8 +127,17 @@ def _push(text: str) -> bool:
                 api.push_message(PushMessageRequest(
                     to=gid, messages=[TextMessage(text=text)]))
                 ok = True
-            except Exception:
-                log.exception("推送到群組 %s 失敗", gid)
+            except Exception as e:
+                body = ""
+                if hasattr(e, "body"):
+                    body = str(getattr(e, "body", ""))[:200]
+                status = getattr(e, "status", None)
+                if status == 429:
+                    # 額度用罄等情境：暫停推播 1 小時，避免無效重試洗日誌
+                    _pause_until = time.time() + 3600
+                    log.error("LINE 推播被拒（429）：%s — 暫停推播 1 小時", body or e)
+                else:
+                    log.error("推送到群組 %s 失敗：%s %s", gid, status, body or e)
     if ok:
         _count += 1
     return ok
@@ -133,6 +145,7 @@ def _push(text: str) -> bool:
 
 _count = 0
 _day = ""
+_pause_until = 0.0
 
 
 # ---------------------------------------------------------------- MLB
