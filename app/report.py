@@ -252,8 +252,8 @@ def format_script(result: dict, away: TeamInput, home: TeamInput,
         f"總分情境來看，低比分佔百分之{_pct(ts['low'])}，"
         f"中等總分百分之{_pct(ts['mid'])}，大比分之戰則是百分之{_pct(ts['high'])}。"
         f"數據僅供參考，理性看球。"
-        f"想知道更多賽前預測，LINE搜尋勝負密碼，"
-        f"讓機器人幫你分析每一場。"
+        f"想知道更多賽前預測，LINE搜尋st130330，"
+        f"免費賽事討論群，讓機器人幫你分析每一場。"
     )
     approx_sec = round(len(body) / 4.5)
     return (f"🎙️ 口播文案（約 {approx_sec} 秒｜{len(body)} 字）\n\n"
