@@ -29,6 +29,9 @@ HELP_TEXT = (
     "（MLB / NPB / KBO / CPBL 皆可）\n\n"
     "【即時比分】\n"
     "「即時比分」— 今日各聯盟戰況\n\n"
+    "【短視頻口播文案】\n"
+    "「道奇 vs 洋基 文案」— 產生 60 秒\n"
+    "配音稿，直接貼給 TTS 使用\n\n"
     "【群組使用】\n"
     "在群組中請「@勝負密碼」標註我，\n"
     "我才會回覆喔！（@其他人不會觸發）\n\n"
@@ -181,3 +184,80 @@ def format_schedule(games: list[dict], league_display: str) -> str:
         lines.append(f"{g['date']}{time_part}｜{g['away']} @ {g['home']}")
     lines += ["", "輸入「隊名 vs 隊名」即可分析該場比賽。"]
     return "\n".join(lines)
+
+
+def format_script(result: dict, away: TeamInput, home: TeamInput,
+                  info: GameInfo) -> str:
+    """口播文案版 — 給自動短視頻 TTS 配音用。
+
+    設計原則：
+    - 60 秒左右（中文 TTS 約每秒 4.5 字，全文 250~320 字）
+    - 口語化、句子短、無括號與符號，TTS 直接念不卡頓
+    - 結構：hook → 對戰與近況 → 先發投手 → 模型預測 → 情境 → 收尾導流
+    - 勝率接近時用懸念 hook，懸殊時用看好 hook
+    """
+    wp = result["win_prob"]
+    er = result["expected_runs"]
+    top = result["top_score"]
+    ts = result["total_scenarios"]
+    lo, hi = result["total_range_80"]
+    fav_name, fav_prob = (result["away"], wp["away"]) \
+        if wp["away"] >= wp["home"] else (result["home"], wp["home"])
+
+    # Hook：依勝率差距選口吻
+    if fav_prob >= 60:
+        hook = f"{fav_name}這場被高度看好，但數據真的這麼簡單嗎？"
+    elif fav_prob >= 53:
+        hook = f"{result['away']}對上{result['home']}，雙方勝負難料，這場有看頭！"
+    else:
+        hook = f"五五波的對決，{result['away']}跟{result['home']}誰能帶走勝利？"
+
+    # 近況
+    form_bits = []
+    for t, name in ((away, result["away"]), (home, result["home"])):
+        bits = []
+        if t.wins_last10 is not None:
+            bits.append(f"近十場拿{t.wins_last10}勝")
+        if name == result["home"] and t.home_record:
+            bits.append(f"主場{t.home_record.split(' ')[-1] if ' ' in t.home_record else t.home_record}")
+        if name == result["away"] and t.road_record:
+            bits.append(f"客場{t.road_record.split(' ')[-1] if ' ' in t.road_record else t.road_record}")
+        if bits:
+            form_bits.append(f"{name}{'、'.join(bits)}")
+    form_sent = "。".join(form_bits) + "。" if form_bits else ""
+
+    # 先發投手
+    pit_bits = []
+    for t in (away, home):
+        if t.starter_name:
+            era = f"，本季防禦率{t.starter_era:.2f}" if t.starter_era else ""
+            pit_bits.append(f"{t.name}推出{t.starter_name}{era}")
+    pit_sent = ("先發投手方面，" + "；".join(pit_bits) + "。"
+                if pit_bits else "先發投手尚未公布。")
+
+    def _pct(x) -> str:
+        return str(int(round(float(x))))
+
+    body = (
+        f"{hook}"
+        f"{result['league']}賽事，{result['away']}對上{result['home']}。"
+        f"{form_sent}"
+        f"{pit_sent}"
+        f"直接看模型預測：{result['away']}勝率百分之{_pct(wp['away'])}，"
+        f"{result['home']}勝率百分之{_pct(wp['home'])}。"
+        f"預期得分{er['away']}比{er['home']}，"
+        f"兩隊合計最可能落在{lo}到{hi}分之間。"
+        f"其中機率最高的完賽比分是"
+        f"{top['score'][0]}比{top['score'][1]}，機率百分之{_pct(top['prob'])}。"
+        f"總分情境來看，低比分佔百分之{_pct(ts['low'])}，"
+        f"中等總分百分之{_pct(ts['mid'])}，大比分之戰則是百分之{_pct(ts['high'])}。"
+        f"數據僅供參考，理性看球。"
+        f"想知道更多賽前預測，LINE搜尋勝負密碼，"
+        f"讓機器人幫你分析每一場。"
+    )
+    approx_sec = round(len(body) / 4.5)
+    return (f"🎙️ 口播文案（約 {approx_sec} 秒｜{len(body)} 字）\n\n"
+            f"{body}\n\n"
+            f"———\n"
+            f"📝 使用方式：全文直接貼給 TTS 配音；"
+            f"想縮到 30 秒可刪去近況與投手段落。")

@@ -45,6 +45,7 @@ parser = WebhookParser(CHANNEL_SECRET)
 VS_PATTERN = re.compile(r"(.+?)\s*(?:vs\.?|對上|對|@)\s*(.+)")
 RECENT_PATTERN = re.compile(r"最近.*比賽|即將開打|近期賽程")
 SCORE_PATTERN = re.compile(r"即時比分|^比分$|比分表|live score|^live$", re.I)
+SCRIPT_PATTERN = re.compile(r"文案|口播|腳本|短視頻|配音|shorts?", re.I)
 
 _bot_info: tuple[str | None, str | None] = (None, None)
 
@@ -113,6 +114,10 @@ def _handle_schedule(text: str, reply_token: str) -> None:
 
 
 def _handle_matchup(text: str, reply_token: str) -> None:
+    # 「文案／口播」→ 短視頻配音稿；先把關鍵字從查詢中移除
+    as_script = bool(SCRIPT_PATTERN.search(text))
+    if as_script:
+        text = SCRIPT_PATTERN.sub("", text).strip(" ，,、")
     m = VS_PATTERN.match(text)
     if not m:
         # 國際賽事關鍵字（無對戰組合）→ 賽事資訊
@@ -151,6 +156,10 @@ def _handle_matchup(text: str, reply_token: str) -> None:
 
     away, home, info = matchup
     result = analyze(away, home, provider.context)
+    if as_script:
+        from app.report import format_script
+        _reply(reply_token, format_script(result, away, home, info))
+        return
     report = format_report(result, away, home, info, datetime.now())
     _reply(reply_token, report)
 
